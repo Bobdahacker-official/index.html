@@ -180,3 +180,59 @@ pub fn init(){unsafe{
     crate::hardware::log(format_args!("CPU FAULT vector={} error={:#x} rip={:#x} cr2={:#x}\n",vector,error,rip,cr2));
     loop{unsafe{asm!("cli; hlt");}}
 }
+
+#[repr(C,packed)]
+struct TaskState {
+    reserved0:u32,
+    rsp:[u64;3],
+    reserved1:u64,
+    ist:[u64;7],
+    reserved2:u64,
+    reserved3:u16,
+    io_map:u16,
+}
+const _:()=assert!(core::mem::size_of::<TaskState>()==104);
+
+struct KernelStack {bottom:u64,top:u64}
+impl KernelStack {
+    fn allocate(mapper:&mut crate::paging::Mapper,memory:&mut crate::memory::Physical,size:u64)->Result<Self,crate::paging::Error>{
+        let frame=memory.try_allocate(size).ok_or(crate::paging::Error::OutOfFrames)?;
+        unsafe{core::ptr::write_bytes(frame,0,size as usize);}
+        let physical=frame as u64-memory.direct;
+        let permissions=crate::paging::Permissions{writable:true,executable:false,user:false,uncached:false};
+        let base=match unsafe{mapper.map_physical(memory,physical,size as usize,permissions)}{
+            Ok(pointer)=>pointer as u64,
+            Err(error)=>{unsafe{memory.release_range(physical,size)}.map_err(|_|crate::paging::Error::FrameOwnership)?;return Err(error);}
+        };
+        Ok(Self{bottom:base,top:base+size})
+    }
+}
+
+pub struct CpuTables {gdt:[u64;7],tss:TaskState,stacks:[KernelStack;4]}
+impl CpuTables {
+    pub fn kernel_stack(&self)->u64{self.stacks[0].top}
+    pub fn kernel_stack_bottom(&self)->u64{self.stacks[0].bottom}
+    /// Call with interrupts disabled during a task switch. The target stack must
+    /// be supervisor-writable, resident, and mapped in every active kernel root.
+    pub unsafe fn set_kernel_stack(&mut self,top:u64){core::ptr::addr_of_mut!(self.tss.rsp).cast::<u64>().write_unaligned(top);}
+}
+
+pub fn install_descriptors(mapper:&mut crate::paging::Mapper,memory:&mut crate::memory::Physical)->Result<&'static mut CpuTables,crate::paging::Error>{
+    use alloc::boxed::Box;
+    let stacks=[KernelStack::allocate(mapper,memory,64*1024)?,KernelStack::allocate(mapper,memory,32*1024)?,KernelStack::allocate(mapper,memory,32*1024)?,KernelStack::allocate(mapper,memory,32*1024)?];
+    let rsp=[0;3];let ist=[stacks[1].top,stacks[2].top,stacks[3].top,0,0,0,0];
+    let tables=Box::leak(Box::new(CpuTables{gdt:[0,0x00af9a000000ffff,0x00cf92000000ffff,0x00cff2000000ffff,0x00affa000000ffff,0,0],tss:TaskState{reserved0:0,rsp,reserved1:0,ist,reserved2:0,reserved3:0,io_map:104},stacks}));
+    unsafe{tables.set_kernel_stack(tables.kernel_stack());}
+    let base=core::ptr::addr_of!(tables.tss)as u64;let limit=(core::mem::size_of::<TaskState>()-1)as u64;
+    tables.gdt[5]=(limit&0xffff)|((base&0xffffff)<<16)|(0x89<<40)|((limit&0xf0000)<<32)|((base&0xff000000)<<32);tables.gdt[6]=base>>32;
+    let descriptor=Descriptor{limit:(core::mem::size_of_val(&tables.gdt)-1)as u16,base:tables.gdt.as_ptr()as u64};
+    unsafe{
+        asm!("cli","lgdt [{}]","push 0x08","lea rax, [rip + 2f]","push rax","retfq","2:","mov ax, 0x10","mov ds, ax","mov es, ax","mov ss, ax","mov ax, 0x28","ltr ax",in(reg)&descriptor,out("rax")_);
+        init();
+        let idt=core::ptr::addr_of_mut!(IDT).cast::<Gate>();
+        core::ptr::addr_of_mut!((*idt.add(8)).ist).write(1);
+        core::ptr::addr_of_mut!((*idt.add(2)).ist).write(2);
+        core::ptr::addr_of_mut!((*idt.add(18)).ist).write(3);
+    }
+    Ok(tables)
+}
